@@ -2,22 +2,39 @@ import numpy as np
 import scipy.linalg as sla
 from scipy.fft import dct
 
-
 # =============================================================================
-# Sketch operator: SRCT (subsampled randomized cosine transform)
+# Sketch operator
 # =============================================================================
 class SRCT:
     """
-    Scaled SRCT sketch S in R^{s x n}:
-        S x = sqrt(n/s) * R * DCT * D * x
-    with random sign diagonal D and row sampling R.
+    Subsampled Randomized Cosine Transform (SRCT).
+
+    This class implements a structured sketching operator S ∈ R^(s x n) of the form
+
+        S x = sqrt(n / s) * R * C * D * x,
+
+    where
+      - D is a random diagonal matrix with ±1 entries,
+      - C is the orthonormal DCT-II transform,
+      - R selects s rows uniformly without replacement.
+
+    The operator can be applied to a vector x ∈ R^n or to a dense block
+    X ∈ R^(n x m). In the block case, the sketch is applied columnwise.
+
+    Notes
+    -----
+    - This is an SRCT sketch, not an SRFT sketch.
+    - For real-valued problems, SRCT is often convenient because it stays in
+      real arithmetic while still acting as a subspace embedding.
     """
 
     def __init__(self, n: int, s: int, rng=None, sort_idx: bool = False):
         self.n = int(n)
         self.s = int(s)
+
         if not (1 <= self.s <= self.n):
             raise ValueError("Require 1 <= s <= n.")
+
         self.rng = np.random.default_rng() if rng is None else rng
         self.sign = self.rng.choice(np.array([-1.0, 1.0]), size=self.n)
         idx = self.rng.choice(self.n, size=self.s, replace=False)
@@ -25,92 +42,189 @@ class SRCT:
         self.scale = np.sqrt(self.n / self.s)
 
     def __call__(self, X):
+        """
+        Apply the sketch to a vector or dense block.
+
+        Parameters
+        ----------
+        X : ndarray, shape (n,) or (n, m)
+            Input vector or dense block.
+
+        Returns
+        -------
+        Y : ndarray, shape (s,) or (s, m)
+            Sketched vector or dense block.
+        """
         X = np.asarray(X)
-        flat = (X.ndim == 1)
-        if flat:
+        was_vector = (X.ndim == 1)
+
+        if was_vector:
             X = X.reshape(-1, 1)
 
         if X.shape[0] != self.n:
-            raise ValueError(f"SRCT expected first dim {self.n}, got {X.shape[0]}")
+            raise ValueError(f"SRCT expected first dimension {self.n}, got {X.shape[0]}.")
 
-        Y = dct((self.sign[:, None] * X), type=2, norm="ortho", axis=0)
+        Y = dct(self.sign[:, None] * X, type=2, norm="ortho", axis=0)
         Y = self.scale * Y[self.idx, :]
-        return Y[:, 0] if flat else Y
+
+        return Y[:, 0] if was_vector else Y
 
 
 # =============================================================================
-# Helpers
+# Low-level helpers
 # =============================================================================
+
 def _as_matvec(A):
-    """Return matvec callable for A, supporting ndarray/sparse/LinearOperator/callable."""
+    """
+    Convert A into a matrix-vector callable.
+
+    Supported inputs
+    ----------------
+    - callable: assumed to already implement A(v)
+    - LinearOperator-like: must provide `.matvec`
+    - ndarray / sparse matrix: must support `A @ v`
+
+    Returns
+    -------
+    A_mv : callable
+        Function such that A_mv(v) returns A @ v.
+    """
     if callable(A):
         return A
-    if hasattr(A, "matvec"):  # LinearOperator
+    if hasattr(A, "matvec"):
         return lambda v: A.matvec(v)
     return lambda v: A @ v
 
-
 def _apply_A_to_block(A_mv, U):
-    """Compute AU columnwise robustly for callable matvec."""
+    """
+    Apply A to each column of a dense block U.
+
+    This helper is written defensively so it works even when A is only
+    available as a vector matvec, not as a block operator.
+
+    Parameters
+    ----------
+    A_mv : callable
+        Matrix-vector operator.
+    U : ndarray, shape (n, k)
+
+    Returns
+    -------
+    AU : ndarray, shape (n, k)
+    """
     if U.size == 0:
         return U
-    cols = [A_mv(U[:, i]) for i in range(U.shape[1])]
+    cols = [A_mv(U[:, j]) for j in range(U.shape[1])]
     return np.column_stack(cols)
 
 
 def _solve_ls(SAW, Sr, method="lstsq"):
-    """Solve min ||SAW y - Sr||_2."""
+    """
+    Solve the sketched least-squares problem
+
+        min_y || SAW y - Sr ||_2.
+
+    Parameters
+    ----------
+    SAW : ndarray, shape (s, m)
+        Sketched basis of the current augmented search space.
+    Sr : ndarray, shape (s,)
+        Sketched right-hand side / sketched residual.
+    method : {"lstsq", "\\", "pinv", "qr"}
+        Dense least-squares backend.
+
+    Returns
+    -------
+    y : ndarray, shape (m,)
+        Least-squares coefficient vector.
+    """
     if SAW.size == 0:
         return np.zeros((0,), dtype=Sr.dtype)
 
     if method in ("lstsq", "\\"):
         y, *_ = np.linalg.lstsq(SAW, Sr, rcond=None)
         return y
+
     if method == "pinv":
         return np.linalg.pinv(SAW) @ Sr
+
     if method == "qr":
         Q, R = np.linalg.qr(SAW, mode="reduced")
         return sla.solve_triangular(R, Q.conj().T @ Sr, lower=False)
+
     raise ValueError(f"Unknown ls_solve method: {method}")
 
 
 def _ordered_qz(HH, Sig, k, harmonic=True):
     """
-    Ordered QZ similar to MATLAB:
-      - compute generalized eigs of (HH, Sig)
-      - harmonic: keep largest |lambda|; non-harm: keep smallest |lambda|
-      - use scipy.linalg.ordqz with a predicate based on a threshold.
-    Returns (AA, BB, Z, keep) where keep includes 2x2 block safety.
+    Reorder the generalized Schur form of (HH, Sig) to keep the desired
+    Ritz components in the leading block.
+
+    Parameters
+    ----------
+    HH : ndarray, shape (ell, ell)
+        Small projected matrix from the recycling extraction step.
+    Sig : ndarray, shape (ell, ell)
+        Diagonal singular-value matrix from the truncated SVD.
+    k : int
+        Target recycling-space dimension before 2x2 block protection.
+    harmonic : bool, default=True
+        If True, keep the k generalized eigenvalues of largest magnitude
+        (harmonic Ritz extraction). Otherwise keep the smallest ones
+        (standard Ritz extraction).
+
+    Returns
+    -------
+    AA : ndarray
+        Reordered generalized Schur A-factor.
+    BB : ndarray
+        Reordered generalized Schur B-factor.
+    Z : ndarray
+        Right Schur vectors.
+    keep : int
+        Number of vectors to keep after protecting 2x2 blocks.
     """
     n = HH.shape[0]
     if k <= 0 or n == 0:
         return None, None, np.eye(n, dtype=HH.dtype), 0
 
-    # Determine ordering threshold from eigvals
     eigs = sla.eigvals(HH, Sig)
     mags = np.abs(eigs)
     mags_sorted = np.sort(mags)
 
     k_eff = min(k, n)
+
     if harmonic:
         thr = mags_sorted[-k_eff]
+
         def pred(alpha, beta):
-            lam = alpha / beta
-            return np.abs(lam) >= thr
+            alpha = np.asarray(alpha)
+            beta = np.asarray(beta)
+            out = np.ones_like(alpha, dtype=bool)   # beta=0 => keep (infinite magnitude)
+            mask = (np.abs(beta) > 0)
+            lam = np.empty_like(alpha, dtype=np.result_type(alpha, beta, np.complex128))
+            lam[mask] = alpha[mask] / beta[mask]
+            out[mask] = np.abs(lam[mask]) >= thr
+            return out
+
     else:
         thr = mags_sorted[k_eff - 1]
+
         def pred(alpha, beta):
-            lam = alpha / beta
-            return np.abs(lam) <= thr
+            alpha = np.asarray(alpha)
+            beta = np.asarray(beta)
+            out = np.zeros_like(alpha, dtype=bool)  # beta=0 => do not keep for smallest magnitude
+            mask = (np.abs(beta) > 0)
+            lam = np.empty_like(alpha, dtype=np.result_type(alpha, beta, np.complex128))
+            lam[mask] = alpha[mask] / beta[mask]
+            out[mask] = np.abs(lam[mask]) <= thr
+            return out
 
     output_type = "real" if (np.isrealobj(HH) and np.isrealobj(Sig)) else "complex"
     AA, BB, alpha, beta, Q, Z = sla.ordqz(HH, Sig, sort=pred, output=output_type)
 
-    # Base keep: attempt to keep k vectors; predicate can select >k with ties.
-    # We choose keep=k_eff, then apply MATLAB 2x2 block safety on AA/BB.
     keep = k_eff
-    if keep > 0 and keep < AA.shape[0]:
-        # MATLAB check: (AA(k+1,k) != 0 || BB(k+1,k) != 0) in 1-based indexing
+    if 0 < keep < AA.shape[0]:
         if (AA[keep, keep - 1] != 0) or (BB[keep, keep - 1] != 0):
             keep = min(keep + 1, AA.shape[0])
 
@@ -118,12 +232,36 @@ def _ordered_qz(HH, Sig, k, harmonic=True):
 
 
 # =============================================================================
-# One GMRES-SDR cycle
+# One restart cycle
 # =============================================================================
 def srgmres_cycle(A_mv, r0, param):
     """
-    One cycle for correction equation A e ≈ r0.
-    Returns: e, r, out
+    Perform one GMRES-SDR restart cycle for the correction equation
+
+        A e ≈ r0.
+
+    The cycle builds a truncated Krylov basis, periodically solves a small
+    sketched least-squares problem to estimate convergence, and forms the
+    true correction only when needed. At the end of the cycle, it updates the
+    recycling subspace by harmonic or standard Ritz extraction.
+
+    Parameters
+    ----------
+    A_mv : callable
+        Matrix-vector operator.
+    r0 : ndarray, shape (n,)
+        Residual at the start of the cycle.
+    param : dict
+        Parameter dictionary.
+
+    Returns
+    -------
+    e : ndarray, shape (n,)
+        Correction computed in this cycle.
+    r : ndarray, shape (n,)
+        True residual after applying the correction.
+    out : dict
+        Cycle diagnostics and updated recycling data.
     """
     max_it = int(param.get("max_it", 50))
     tol = float(param.get("tol", 1e-6))
@@ -139,15 +277,20 @@ def srgmres_cycle(A_mv, r0, param):
     hS = param["hS"]
     sketch_distortion = float(param.get("sketch_distortion", 1.4))
 
-    r0 = np.asarray(r0)
+    r0 = np.asarray(r0).reshape(-1)
     n = r0.shape[0]
+
+    # Sketch once up front to discover the sketch dimension and dtype.
     Sr0 = hS(r0)
     sdim = Sr0.shape[0]
 
-    # Recycling
+    # -------------------------------------------------------------------------
+    # Recycling subspace and its sketches
+    # -------------------------------------------------------------------------
     U = param.get("U", None)
     SU = param.get("SU", None)
     SAU = param.get("SAU", None)
+
     if U is None or U.size == 0:
         U = np.empty((n, 0), dtype=r0.dtype)
         SU = np.empty((sdim, 0), dtype=Sr0.dtype)
@@ -159,40 +302,57 @@ def srgmres_cycle(A_mv, r0, param):
             AU = _apply_A_to_block(A_mv, U)
             SAU = hS(AU)
 
-    # Counters
-    mv = 0
-    ip = 0
-    sv = 0
+    # Cycle-local counters.
+    mv = 0   # matrix-vector products
+    ip = 0   # inner products / explicit norms counted like MATLAB
+    sv = 0   # sketch applications
 
-    # Build sketches of recycling space for this cycle
+    # Reuse or recompute the sketch of A*U.
+    SW = SU
     if U.shape[1] == 0:
-        SW = SU
         SAW = SAU
     else:
-        SW = SU
         if pert == 0:
             SAW = SAU
         else:
             AU = _apply_A_to_block(A_mv, U)
             SAW = hS(AU)
-            mv += U.shape[1]  # equivalent matvec count
+            mv += U.shape[1]
             sv += U.shape[1]
 
-    # Initial residual sketch
-    Sr = hS(r0); sv += 1
+    # -------------------------------------------------------------------------
+    # Initial residual and normalized first Krylov vector
+    # -------------------------------------------------------------------------
+    Sr = hS(r0)
+    sv += 1
+
+    # In the sketch-and-select variants, the MATLAB code normalizes with the
+    # sketch norm rather than the true residual norm.
     if ssa in (1, 2):
         nrm = np.linalg.norm(Sr)
     else:
-        nrm = np.linalg.norm(r0); ip += 1
+        nrm = np.linalg.norm(r0)
+        ip += 1
 
+    # Zero residual: nothing to do.
     if nrm == 0:
         e = np.zeros_like(r0)
-        out = dict(U=U, SU=SW, SAU=SAW, hS=hS, k=U.shape[1], m=0,
-                   mv=mv, ip=ip, sv=sv, sres=np.array([], dtype=float),
-                   sketch_distortion=sketch_distortion)
-        return e, r0, out
+        out = {
+            "U": U,
+            "SU": SW,
+            "SAU": SAW,
+            "hS": hS,
+            "k": int(U.shape[1]),
+            "m": 0,
+            "mv": int(mv),
+            "ip": int(ip),
+            "sv": int(sv),
+            "sres": np.array([], dtype=float),
+            "sketch_distortion": float(sketch_distortion),
+        }
+        return e, r0.copy(), out
 
-    # Preallocate Krylov basis
+    # Basis arrays.
     dtypeV = np.result_type(r0.dtype, np.complex128 if np.iscomplexobj(r0) else np.float64)
     V = np.zeros((n, max_it + 1), dtype=dtypeV)
     SV = np.zeros((sdim, max_it + 1), dtype=Sr.dtype)
@@ -207,14 +367,17 @@ def srgmres_cycle(A_mv, r0, param):
     r = None
     m_final = 0
 
+    # -------------------------------------------------------------------------
+    # Inner Arnoldi / sketched-Arnoldi loop
+    # -------------------------------------------------------------------------
     for j in range(1, max_it + 1):
         j0 = j - 1
+        w = A_mv(V[:, j0])
+        mv += 1
 
-        w = A_mv(V[:, j0]); mv += 1
-
-        # -------------------------
-        # Arnoldi variants
-        # -------------------------
+        # ---------------------------------------------------------------------
+        # ssa = 0: standard t-truncated Arnoldi in the full space
+        # ---------------------------------------------------------------------
         if ssa == 0:
             i_start = max(j0 - t + 1, 0)
             for i in range(i_start, j0 + 1):
@@ -228,20 +391,26 @@ def srgmres_cycle(A_mv, r0, param):
             ip += 1
 
             if hnext == 0:
-                # Happy breakdown: Krylov subspace is invariant
-                # We'll stop expanding basis; handle at checkpoint below.
+                # Happy breakdown: the current Krylov space is A-invariant.
                 V[:, j0 + 1] = 0
                 SV[:, j0 + 1] = 0
             else:
                 V[:, j0 + 1] = w / hnext
-                SV[:, j0 + 1] = hS(V[:, j0 + 1]); sv += 1
+                SV[:, j0 + 1] = hS(V[:, j0 + 1])
+                sv += 1
 
+            # For standard Arnoldi, S*A*V(:,j) can be assembled from S*V and H.
             SAV[:, j0] = SV[:, : (j0 + 2)] @ H[: (j0 + 2), j0]
 
+        # ---------------------------------------------------------------------
+        # ssa = 1: sketched t-truncated Arnoldi
+        # ---------------------------------------------------------------------
         elif ssa == 1:
-            sw = hS(w); sv += 1
+            sw = hS(w)
+            sv += 1
             SAV[:, j0] = sw
 
+            # Quasi-orthogonalize against the recycled subspace using sketches.
             if U.shape[1] > 0:
                 coeffs = np.linalg.lstsq(SU, sw, rcond=None)[0]
                 w = w - U @ coeffs
@@ -264,12 +433,18 @@ def srgmres_cycle(A_mv, r0, param):
             H[ind, j0] = coeffs
             H[j0 + 1, j0] = nsw
 
+        # ---------------------------------------------------------------------
+        # ssa = 2: sketch-and-select
+        # ---------------------------------------------------------------------
         elif ssa == 2:
-            sw = hS(w); sv += 1
+            sw = hS(w)
+            sv += 1
             SAV[:, j0] = sw
 
-            coeffs_full = np.linalg.lstsq(SV[:, :j0 + 1], sw, rcond=None)[0] if j0 >= 0 else np.array([0.0])
+            coeffs_full = np.linalg.lstsq(SV[:, : j0 + 1], sw, rcond=None)[0]
             t_eff = min(t, coeffs_full.shape[0])
+
+            # Select the t entries of largest magnitude.
             sel = np.argpartition(np.abs(coeffs_full), -t_eff)[-t_eff:]
             coeffs = coeffs_full[sel]
 
@@ -288,13 +463,14 @@ def srgmres_cycle(A_mv, r0, param):
             H[j0 + 1, j0] = nsw
 
         else:
-            raise ValueError("ssa must be 0, 1, or 2.")
+            raise ValueError("ssa must be one of {0, 1, 2}.")
 
-        # -------------------------
-        # Checkpoint every d iters
-        # -------------------------
+        # ---------------------------------------------------------------------
+        # Checkpoint every d iterations, at max_it, or on happy breakdown.
+        # At a checkpoint we solve the sketched least-squares problem and only
+        # form the true correction/residual if the sketch says it is worthwhile.
+        # ---------------------------------------------------------------------
         if (j % d == 0) or (j == max_it) or (H[j0 + 1, j0] == 0):
-            # Current bases include SV[:, :j] and SAV[:, :j]
             SW_cur = np.hstack([SW, SV[:, :j]]) if SW.size else SV[:, :j].copy()
             SAW_cur = np.hstack([SAW, SAV[:, :j]]) if SAW.size else SAV[:, :j].copy()
 
@@ -309,9 +485,14 @@ def srgmres_cycle(A_mv, r0, param):
                 else:
                     e = V[:, :j] @ y
 
-                r = r0 - A_mv(e); mv += 1
-                nrmr = np.linalg.norm(r); ip += 1
+                r = r0 - A_mv(e)
+                mv += 1
 
+                nrmr = np.linalg.norm(r)
+                ip += 1
+
+                # Keep a conservative empirical safeguard between sketched and
+                # true residual norms.
                 ratio = nrmr / max(sres_val, np.finfo(float).tiny)
                 if ratio > sketch_distortion:
                     sketch_distortion = ratio
@@ -319,23 +500,44 @@ def srgmres_cycle(A_mv, r0, param):
                         print(f"  sketch distortion increased to {sketch_distortion:g}")
 
                 m_final = j
+
                 if (nrmr < tol) or (j == max_it) or (H[j0 + 1, j0] == 0):
                     break
 
-    # Final active sizes
+    # If we never formed a correction inside the loop, do it now from the
+    # latest available basis. This should be rare, but makes the routine safe.
+    if e is None or r is None:
+        m_final = max(m_final, max_it)
+        SW_cur = np.hstack([SW, SV[:, :m_final]]) if SW.size else SV[:, :m_final].copy()
+        SAW_cur = np.hstack([SAW, SAV[:, :m_final]]) if SAW.size else SAV[:, :m_final].copy()
+
+        y = _solve_ls(SAW_cur, Sr, method=ls_solve)
+        nu = U.shape[1]
+        if nu > 0:
+            e = U @ y[:nu] + V[:, :m_final] @ y[nu:]
+        else:
+            e = V[:, :m_final] @ y
+
+        r = r0 - A_mv(e)
+        mv += 1
+        ip += 1
+
     m = max(m_final, 1)
 
-    # Build final SW/SAW for recycling update
+    # -------------------------------------------------------------------------
+    # Recycling-space update
+    # -------------------------------------------------------------------------
     SW_cur = np.hstack([SW, SV[:, :m]]) if SW.size else SV[:, :m].copy()
     SAW_cur = np.hstack([SAW, SAV[:, :m]]) if SAW.size else SAV[:, :m].copy()
 
-    # SVD for harmonic/standard extraction
     if SAW_cur.size == 0 and SW_cur.size == 0:
         U_new = np.empty((n, 0), dtype=r0.dtype)
         SU_new = np.empty((sdim, 0), dtype=Sr.dtype)
         SAU_new = np.empty((sdim, 0), dtype=Sr.dtype)
         keep = 0
     else:
+        # Harmonic extraction uses the SVD of SAW, while standard extraction
+        # uses the SVD of SW.
         if harmonic:
             Lfull, Sigvals, Vh = sla.svd(SAW_cur, full_matrices=False)
         else:
@@ -358,15 +560,15 @@ def srgmres_cycle(A_mv, r0, param):
             Sig = np.diag(Sigvals[:ell])
             J = Vh.conj().T[:, :ell]
 
-            # MATLAB matching:
-            # harmonic: HH = L'*SW*J ; non-harm: HH = L'*SAW*J
+            # Match the MATLAB logic:
+            #   harmonic     -> HH = L^* SW  J
+            #   non-harmonic -> HH = L^* SAW J
             if harmonic:
                 HH = L.conj().T @ SW_cur @ J
             else:
                 HH = L.conj().T @ SAW_cur @ J
 
             AA, BB, Z, keep = _ordered_qz(HH, Sig, k_use, harmonic=harmonic)
-
             JZ = J @ Z[:, :keep]
 
             nu = U.shape[1]
@@ -378,42 +580,107 @@ def srgmres_cycle(A_mv, r0, param):
             SU_new = SW_cur @ JZ
             SAU_new = SAW_cur @ JZ
 
-    out = dict(
-        U=U_new, SU=SU_new, SAU=SAU_new, hS=hS,
-        k=int(keep), m=int(m),
-        mv=int(mv), ip=int(ip), sv=int(sv),
-        sres=np.array(sres, dtype=float),
-        sketch_distortion=float(sketch_distortion),
-    )
+    out = {
+        "U": U_new,
+        "SU": SU_new,
+        "SAU": SAU_new,
+        "hS": hS,
+        "k": int(keep),
+        "m": int(m),
+        "mv": int(mv),
+        "ip": int(ip),
+        "sv": int(sv),
+        "sres": np.array(sres, dtype=float),
+        "sketch_distortion": float(sketch_distortion),
+    }
     return e, r, out
 
 
 # =============================================================================
-# Top-level GMRES-SDR
+# Top-level solver
 # =============================================================================
 def gmres_sdr(A, b, param=None):
     """
-    Solve Ax=b with GMRES-SDR (sketched and deflated restarted GMRES).
-    Parameters (param dict, optional):
-      x0, max_it, max_restarts, tol
-      U, SU, SAU, k, t
-      hS (callable sketch), s
-      verbose, ssa (0/1/2), d
-      pert (0 reuse SAU; 1 recompute SAU each cycle)
-      sketch_distortion, ls_solve ('lstsq'/'qr'/'pinv'), svd_tol, harmonic
-      rng (np.random.Generator) for sketch reproducibility
-    Returns: x, out
+    Solve Ax = b with GMRES-SDR:
+    sketched, deflated, restarted GMRES with recycling.
+
+    Parameters
+    ----------
+    A : ndarray, sparse matrix, LinearOperator, or callable
+        Linear operator for the system. If callable, it must implement A(v).
+    b : ndarray, shape (n,)
+        Right-hand side.
+    param : dict, optional
+        Solver parameters. Supported entries include
+
+        x0 : ndarray
+            Initial guess.
+        max_it : int
+            Maximum number of inner iterations per restart cycle.
+        max_restarts : int
+            Maximum number of restart cycles.
+        tol : float
+            Absolute residual tolerance.
+        U, SU, SAU : ndarrays
+            Recycling basis and its sketches.
+        k : int
+            Target recycling-space dimension.
+        t : int
+            Truncation parameter in Arnoldi.
+        hS : callable
+            Sketch operator.
+        s : int
+            Sketch dimension, used only if hS is not supplied.
+        verbose : int
+            Verbosity level.
+        ssa : int
+            Arnoldi variant:
+                0 -> standard t-truncated Arnoldi
+                1 -> sketched t-truncated Arnoldi
+                2 -> sketch-and-select
+        d : int
+            Checkpoint frequency for sketched residual tests.
+        pert : int
+            If 0, reuse SAU across cycles. If 1, recompute SAU each cycle.
+        sketch_distortion : float
+            Conservative bound relating true and sketched residual norms.
+        ls_solve : str
+            Least-squares backend: {"lstsq", "\\", "pinv", "qr"}.
+        svd_tol : float
+            Relative tolerance for truncating the recycling SVD.
+        harmonic : bool or int
+            If true, use harmonic Ritz extraction; otherwise standard Ritz.
+        rng : np.random.Generator
+            Random generator used when creating the default sketch.
+
+    Returns
+    -------
+    x : ndarray, shape (n,)
+        Approximate solution.
+    out : dict
+        Aggregate solver diagnostics with fields including
+
+        residuals : ndarray
+            True residual norms by restart cycle.
+        iters : ndarray
+            Inner iteration counts by cycle.
+        sres : ndarray
+            Sketched residual history collected at checkpoints.
+        mv, ip, sv : int
+            Counts of matrix-vector products, inner products, and sketches.
+        U, SU, SAU : ndarrays
+            Updated recycling basis and its sketches.
     """
     param = {} if param is None else dict(param)
 
-    b = np.asarray(b)
-    if b.ndim != 1:
-        b = b.reshape(-1)
+    b = np.asarray(b).reshape(-1)
     n = b.shape[0]
 
     A_mv = _as_matvec(A)
 
+    # -------------------------------------------------------------------------
     # Defaults
+    # -------------------------------------------------------------------------
     verbose = int(param.get("verbose", 1))
     max_it = int(param.get("max_it", 50))
     max_restarts = int(param.get("max_restarts", min(int(np.ceil(n / max_it)), 10)))
@@ -435,35 +702,79 @@ def gmres_sdr(A, b, param=None):
     if verbose:
         print(f"  using sketching dimension of s = {s}")
 
-    if "hS" not in param or param["hS"] is None:
+    if ("hS" not in param) or (param["hS"] is None):
         rng = param.get("rng", None)
         param["hS"] = SRCT(n, s, rng=rng)
 
-    # Init x, r
-    if "x0" in param and param["x0"] is not None:
+    # -------------------------------------------------------------------------
+    # Initial guess and residual
+    # -------------------------------------------------------------------------
+    if ("x0" in param) and (param["x0"] is not None):
         x = np.asarray(param["x0"]).reshape(-1)
         r = b - A_mv(x)
     else:
         x = np.zeros_like(b)
         r = b.copy()
 
-    # Init recycling
-    if "U" not in param or param["U"] is None:
+    # -------------------------------------------------------------------------
+    # Initialize recycling data if absent
+    # -------------------------------------------------------------------------
+    if ("U" not in param) or (param["U"] is None):
         param["U"] = np.empty((n, 0), dtype=b.dtype)
-        # Initialize sketch shapes correctly
         Sr = param["hS"](r)
         param["SU"] = np.empty((Sr.shape[0], 0), dtype=Sr.dtype)
         param["SAU"] = np.empty((Sr.shape[0], 0), dtype=Sr.dtype)
+    else:
+        # Make sure sketch blocks exist if a recycle space is supplied.
+        U = param["U"]
+        Sr = param["hS"](r)
+        if ("SU" not in param) or (param["SU"] is None):
+            param["SU"] = param["hS"](U) if U.size else np.empty((Sr.shape[0], 0), dtype=Sr.dtype)
+        if ("SAU" not in param) or (param["SAU"] is None):
+            if U.size:
+                param["SAU"] = param["hS"](_apply_A_to_block(A_mv, U))
+            else:
+                param["SAU"] = np.empty((Sr.shape[0], 0), dtype=Sr.dtype)
 
-    residuals = [np.linalg.norm(b)]
+    # Diagnostics accumulated across restart cycles.
+    residuals = [float(np.linalg.norm(r))]
     iters = [0]
     sres_all = [np.nan]
 
     mv_total = 0
-    ip_total = 1  # for norm(b)
+    ip_total = 1  # for the initial true residual norm
     sv_total = 0
-    cycle_out = {}
 
+    cycle_out = {
+        "U": param["U"],
+        "SU": param["SU"],
+        "SAU": param["SAU"],
+        "hS": param["hS"],
+        "k": int(param["U"].shape[1]),
+        "m": 0,
+        "mv": 0,
+        "ip": 0,
+        "sv": 0,
+        "sres": np.array([], dtype=float),
+        "sketch_distortion": float(param["sketch_distortion"]),
+    }
+
+    # Early exit if the initial guess already satisfies the tolerance.
+    if residuals[0] < tol:
+        out = dict(cycle_out)
+        out.update(
+            mv=int(mv_total),
+            ip=int(ip_total),
+            sv=int(sv_total),
+            residuals=np.array(residuals, dtype=float),
+            iters=np.array(iters, dtype=int),
+            sres=np.array(sres_all, dtype=float),
+        )
+        return x, out
+
+    # -------------------------------------------------------------------------
+    # Outer restart loop
+    # -------------------------------------------------------------------------
     for _ in range(max_restarts):
         e, r, cycle_out = srgmres_cycle(A_mv, r, param)
         x = x + e
@@ -477,7 +788,7 @@ def gmres_sdr(A, b, param=None):
         ip_total += int(cycle_out["ip"])
         sv_total += int(cycle_out["sv"])
 
-        # Update recycling for next cycle
+        # Carry the updated recycle space into the next cycle.
         param["U"] = cycle_out["U"]
         param["SU"] = cycle_out["SU"]
         param["SAU"] = cycle_out["SAU"]
