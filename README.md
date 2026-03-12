@@ -1,4 +1,4 @@
-# FD-RPB-SDR
+# FD-RPB-SDR: Fermi-Dirac Rational Pole-Based expansion with gmres-SDR
 
 **FD-RPB-SDR** implements the application of the **finite-temperature Fermi–Dirac operator**
 
